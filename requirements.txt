@@ -1,0 +1,9 @@
+streamlit==1.38.0
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.13.1
+pandas_ta==0.3.14b0
+plotly==5.24.1
+pyotp==2.9.0
+smartapi-python==1.4.8
+Pillow==10.4.0
