@@ -1,10 +1,12 @@
 streamlit
 pandas
 numpy
+scipy
 plotly
-ta
 pyotp
 smartapi-python
 logzero
 websocket-client
 openpyxl
+requests
+Pillow
