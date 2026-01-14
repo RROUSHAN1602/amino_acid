@@ -5,7 +5,6 @@ import pyotp
 from SmartApi.smartConnect import SmartConnect
 from datetime import datetime, timedelta, date
 import plotly.express as px
-import pandas_ta as ta
 from scipy.stats import entropy
 from io import BytesIO
 
@@ -26,12 +25,74 @@ def make_batch_labels(chunks):
     return labels
 
 
-# ------------------- EXCEL DOWNLOAD HELPERS -------------------
+# ------------------- EXCEL DOWNLOAD HELPERS (FIX TZ DATETIMES) -------------------
+def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Excel doesn't support timezone-aware datetimes.
+    This function:
+    - converts tz-aware datetime columns to tz-naive
+    - converts tz-aware datetime index to tz-naive
+    """
+    out = df.copy()
+
+    # Fix timezone-aware index
+    if isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None:
+        out.index = out.index.tz_convert(None)
+
+    # Fix timezone-aware datetime columns
+    for col in out.columns:
+        if pd.api.types.is_datetime64tz_dtype(out[col]):
+            out[col] = out[col].dt.tz_convert(None)
+
+    return out
+
+
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name="Sheet1") -> bytes:
+    df = make_excel_safe(df)
+
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
     return output.getvalue()
+
+
+# ------------------- INDICATORS (NO pandas_ta dependency) -------------------
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr = true_range(high, low, close)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+
+def bollinger_bandwidth(close: pd.Series, length: int = 20, std_mult: float = 2.0) -> pd.Series:
+    ma = close.rolling(length).mean()
+    sd = close.rolling(length).std(ddof=0)
+    upper = ma + std_mult * sd
+    lower = ma - std_mult * sd
+    return (upper - lower) / ma.replace(0, np.nan)
+
+
+def cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, period: int = 20) -> pd.Series:
+    denom = (high - low).replace(0, np.nan)
+    mfm = ((close - low) - (high - close)) / denom
+    mfv = mfm * volume
+    return mfv.rolling(period).sum() / volume.rolling(period).sum().replace(0, np.nan)
 
 
 # ------------------- PAGE CONFIG -------------------
@@ -47,12 +108,6 @@ if "alerts" not in st.session_state:
 
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = pd.DataFrame(columns=["stock", "token", "added_at"])
-
-if "last_scan_df" not in st.session_state:
-    st.session_state.last_scan_df = pd.DataFrame()
-
-if "last_watchlist_check" not in st.session_state:
-    st.session_state.last_watchlist_check = pd.DataFrame()
 
 
 # ------------------- ANGEL ONE LOGIN (cached) -------------------
@@ -75,24 +130,18 @@ obj = angel_login()
 # ------------------- FETCH CANDLES (DATE RANGE) -------------------
 def fetch_candles(symbol: str, token: str, interval="ONE_HOUR",
                   from_date: date = None, to_date: date = None) -> pd.DataFrame:
-    """
-    Pull OHLCV from Angel One historical candle API using date range.
-    Chunking by ~30 days to avoid API issues.
-    """
     if from_date is None or to_date is None:
         return pd.DataFrame()
 
-    # Convert dates to datetimes
     start_dt = datetime.combine(from_date, datetime.min.time())
     end_dt = datetime.combine(to_date, datetime.max.time())
-
     if start_dt >= end_dt:
         return pd.DataFrame()
 
     chunk_days = 30
     rows = []
-
     cur_start = start_dt
+
     while cur_start < end_dt:
         cur_end = min(cur_start + timedelta(days=chunk_days), end_dt)
 
@@ -114,55 +163,39 @@ def fetch_candles(symbol: str, token: str, interval="ONE_HOUR",
         return pd.DataFrame()
 
     df = pd.DataFrame(rows, columns=["DateTime", "Open", "High", "Low", "Close", "Volume"])
-    df["DateTime"] = pd.to_datetime(df["DateTime"])
-    df = df.drop_duplicates(subset=["DateTime"]).sort_values("DateTime")
+    df["DateTime"] = pd.to_datetime(df["DateTime"], errors="coerce")
+    df = df.dropna(subset=["DateTime"]).drop_duplicates(subset=["DateTime"]).sort_values("DateTime")
     df.set_index("DateTime", inplace=True)
 
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-
     df = df.dropna()
+
+    # Make index tz-naive for safety (Excel)
+    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        df.index = df.index.tz_convert(None)
+
     return df
 
 
 # ------------------- MARKET FOLDING COMPUTATION -------------------
-def safe_bbw(close: pd.Series, length=20, std=2.0) -> pd.Series:
-    bb = ta.bbands(close, length=length, std=std)
-    if bb is None or bb.empty:
-        return pd.Series(index=close.index, dtype="float64")
-
-    bbb_cols = [c for c in bb.columns if c.endswith("BBB") or "BBB_" in c]
-    if bbb_cols:
-        return bb[bbb_cols[0]]
-
-    # fallback
-    bbu_cols = [c for c in bb.columns if "BBU" in c]
-    bbl_cols = [c for c in bb.columns if "BBL" in c]
-    bbm_cols = [c for c in bb.columns if "BBM" in c]
-    if bbu_cols and bbl_cols and bbm_cols:
-        upper = bb[bbu_cols[0]]
-        lower = bb[bbl_cols[0]]
-        mid = bb[bbm_cols[0]].replace(0, np.nan)
-        return (upper - lower) / mid
-
-    return pd.Series(index=close.index, dtype="float64")
-
-
 def compute_folding(df: pd.DataFrame, window_size=50, smooth=5) -> pd.DataFrame:
     df = df.copy()
 
-    df["RSI"] = ta.rsi(df["Close"], length=14) / 100.0
-    bbw_raw = safe_bbw(df["Close"], length=20, std=2.0)
+    # Features
+    df["RSI"] = rsi(df["Close"], period=14) / 100.0
+
+    bbw_raw = bollinger_bandwidth(df["Close"], length=20, std_mult=2.0)
     df["BBW"] = (bbw_raw - bbw_raw.rolling(50).min()) / (bbw_raw.rolling(50).max() - bbw_raw.rolling(50).min())
 
-    df["NATR"] = ta.atr(df["High"], df["Low"], df["Close"], length=14) / df["Close"]
+    df["NATR"] = atr(df["High"], df["Low"], df["Close"], period=14) / df["Close"]
 
     vol5 = df["Volume"].rolling(5).mean()
     vol10 = df["Volume"].rolling(10).mean().replace(0, np.nan)
     df["VolOsc"] = (vol5 - vol10) / vol10
     df["VolOsc"] = np.tanh(df["VolOsc"])
 
-    df["CMF"] = ta.cmf(df["High"], df["Low"], df["Close"], df["Volume"], length=20)
+    df["CMF"] = cmf(df["High"], df["Low"], df["Close"], df["Volume"], period=20)
 
     features = ["RSI", "BBW", "NATR", "VolOsc", "CMF"]
     df = df.dropna(subset=features).copy()
@@ -235,7 +268,6 @@ tabs = st.sidebar.radio("Select Tab", [
 st.sidebar.divider()
 interval = st.sidebar.selectbox("Interval", ["ONE_HOUR", "ONE_DAY", "FIFTEEN_MINUTE", "FIVE_MINUTE"], index=0)
 
-# Date range selection (replaces lookback days)
 default_to = date.today()
 default_from = default_to - timedelta(days=180)
 from_date = st.sidebar.date_input("From Date", value=default_from)
@@ -252,20 +284,17 @@ if tabs == "Single Stock Analyzer":
     symbol = st.selectbox("Select Stock", options=sorted(stock_list.keys()))
     token = stock_list[symbol]
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        if st.button("➕ Add to Entropy Watchlist"):
-            wl = st.session_state.watchlist
-            exists = (wl["stock"] == symbol).any()
-            if not exists:
-                new_row = pd.DataFrame([{
-                    "stock": symbol, "token": token,
-                    "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }])
-                st.session_state.watchlist = pd.concat([new_row, wl], ignore_index=True)
-                st.success(f"✅ {symbol} added to watchlist")
-            else:
-                st.info("Already in watchlist.")
+    if st.button("➕ Add to Entropy Watchlist"):
+        wl = st.session_state.watchlist
+        if not (wl["stock"] == symbol).any():
+            new_row = pd.DataFrame([{
+                "stock": symbol, "token": token,
+                "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }])
+            st.session_state.watchlist = pd.concat([new_row, wl], ignore_index=True)
+            st.success(f"✅ {symbol} added to watchlist")
+        else:
+            st.info("Already in watchlist.")
 
     if st.button("▶️ Run Analysis"):
         with st.spinner("Fetching candles..."):
@@ -333,13 +362,11 @@ elif tabs == "Scanner":
     labels = make_batch_labels(chunks)
 
     batch_choice = st.selectbox("Select Batch to Scan", options=labels)
-    batch_index = labels.index(batch_choice)
-    symbols = chunks[batch_index]
+    symbols = chunks[labels.index(batch_choice)]
 
     st.info(f"✅ Selected: {batch_choice} | Stocks in this batch: {len(symbols)}")
 
-    scan_btn = st.button("▶️ Run Selected Batch Scan")
-    if scan_btn:
+    if st.button("▶️ Run Selected Batch Scan"):
         results = []
         progress = st.progress(0)
         n = len(symbols)
@@ -362,7 +389,6 @@ elif tabs == "Scanner":
                 prev = usable.iloc[-2] if len(usable) > 1 else last
                 change = float(last["Folding_Score"] - prev["Folding_Score"])
 
-                # Status tags
                 status = "HEALTHY_COMPLEXITY" if last["Folding_Score"] > usable["Folding_Score"].median() else "LOW_COMPLEXITY"
                 if change < -0.35:
                     status = "COLLAPSE_RISK"
@@ -381,8 +407,6 @@ elif tabs == "Scanner":
         else:
             df_res = pd.DataFrame(results, columns=["Stock", "Last Close", "Last Folding Score", "Score Change", "Status"])
             df_res = df_res.sort_values("Last Folding Score", ascending=True)
-
-            st.session_state.last_scan_df = df_res.copy()
 
             st.subheader("✅ Batch Scan Results (sorted by lowest Folding Score first)")
             st.dataframe(df_res, use_container_width=True)
@@ -437,8 +461,6 @@ elif tabs == "Entropy Watchlist":
             if rows:
                 df_live = pd.DataFrame(rows, columns=["Stock", "Close", "Folding Score", "Score Change", "Tag"])
                 df_live = df_live.sort_values("Folding Score", ascending=True)
-                st.session_state.last_watchlist_check = df_live.copy()
-
                 st.dataframe(df_live, use_container_width=True)
 
                 st.download_button(
