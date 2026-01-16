@@ -12,11 +12,13 @@ from Stock_list_token import stock_list
 
 
 # ------------------- COLOR SETTINGS -------------------
-# Low (bad/low score) = Dark Red, High (good/high score) = Dark Blue
-FOLD_COLORSCALE = [
-    [0.0, "#3CF60D"],  # dark red
-    [1.0, "#00008B"],  # dark blue
-]
+# Regime colors (interpretable)
+REGIME_COLORS = {
+    "LOW (Structured)": "#8B0000",   # dark red
+    "MID (Transition)": "#FF8C00",   # orange
+    "HIGH (Chaotic)":   "#00008B",   # dark blue
+}
+
 
 # ------------------- BATCH HELPERS -------------------
 def chunk_list(items, chunk_size=200):
@@ -34,6 +36,11 @@ def make_batch_labels(chunks):
 
 # ------------------- EXCEL DOWNLOAD HELPERS (FIX TZ DATETIMES) -------------------
 def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Excel doesn't support timezone-aware datetimes.
+    - converts tz-aware datetime columns to tz-naive
+    - converts tz-aware datetime index to tz-naive
+    """
     out = df.copy()
 
     # Fix timezone-aware index
@@ -50,7 +57,6 @@ def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
 
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name="Sheet1") -> bytes:
     df = make_excel_safe(df)
-
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -187,25 +193,20 @@ def _fetch_raw(symbol: str, token: str, interval: str, from_date: date, to_date:
     df = df.dropna()
 
     df = df.sort_values("DateTime")
-    df = df.drop_duplicates(subset=["DateTime"], keep="last")  # safe for intraday
+    df = df.drop_duplicates(subset=["DateTime"], keep="last")
     df.set_index("DateTime", inplace=True)
     return df
 
 
 # ------------------- RESAMPLE HOURLY -> DAILY (fallback) -------------------
 def resample_to_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert intraday OHLCV to daily OHLCV.
-    """
+    """Convert intraday OHLCV to daily OHLCV."""
     if df.empty:
         return df
-
-    d = df.copy()
-    if not isinstance(d.index, pd.DatetimeIndex):
+    if not isinstance(df.index, pd.DatetimeIndex):
         return pd.DataFrame()
 
-    # Daily OHLCV
-    daily = d.resample("1D").agg({
+    daily = df.resample("1D").agg({
         "Open": "first",
         "High": "max",
         "Low": "min",
@@ -229,17 +230,13 @@ def fetch_candles(symbol: str, token: str, interval="ONE_HOUR",
 
     raw = _fetch_raw(symbol, token, interval, from_date, to_date)
 
-    # If user selected ONE_DAY, ensure we truly have daily series
     if interval == "ONE_DAY":
-        # Many times Angel returns very few daily rows → fallback
         expected_days = (to_date - from_date).days + 1
         if raw.empty or len(raw) < min(10, expected_days // 4 + 1):
-            # fallback: fetch hourly and resample
             hourly = _fetch_raw(symbol, token, "ONE_HOUR", from_date, to_date)
             daily = resample_to_daily(hourly)
             return daily
 
-        # If raw has daily but weird duplicate dates, keep 1 candle per date
         tmp = raw.reset_index()
         tmp["Date"] = tmp["DateTime"].dt.date
         tmp = tmp.sort_values("DateTime").drop_duplicates(subset=["Date"], keep="last").drop(columns=["Date"])
@@ -289,9 +286,7 @@ def compute_folding(df: pd.DataFrame, window_size=50, smooth=5) -> pd.DataFrame:
     df["Market_Entropy"] = ent
     df["Folding_Score"] = df["Market_Entropy"].rolling(smooth).mean()
 
-    # Future Vol (next 24 candles) — meaningful mostly on intraday; still keep for consistency
     df["Future_Vol"] = df["Close"].shift(-24).rolling(24).std()
-
     return df
 
 
@@ -397,54 +392,93 @@ if tabs == "Single Stock Analyzer":
             st.error(f"⚠️ {alert['message']}")
             add_alert(symbol, token, alert["type"], alert["message"], alert["score"])
 
-        # ---------- PRICE CHART (Red->Blue + Collapse Markers) ----------
-        st.subheader("📈 Price colored by Folding Score (Red=Low, Blue=High)")
+        # ================= INTERPRETABLE PRICE VS SCORE =================
+        st.subheader("📈 Price vs Folding Regimes (Easy Interpretation)")
+
         plot_df = usable.reset_index().copy()
         plot_df["Score_Change"] = plot_df["Folding_Score"].diff()
-        collapse_df = plot_df[plot_df["Score_Change"] < -collapse_threshold].copy()
 
-        # If ONE_DAY, show x as Date (cleaner)
         if interval == "ONE_DAY":
             plot_df["X"] = plot_df["DateTime"].dt.date
-            if not collapse_df.empty:
-                collapse_df["X"] = collapse_df["DateTime"].dt.date
             x_col = "X"
         else:
             x_col = "DateTime"
+
+        q33 = plot_df["Folding_Score"].quantile(0.33)
+        q66 = plot_df["Folding_Score"].quantile(0.66)
+
+        def regime_tag(x):
+            if x <= q33:
+                return "LOW (Structured)"
+            elif x <= q66:
+                return "MID (Transition)"
+            return "HIGH (Chaotic)"
+
+        plot_df["Regime"] = plot_df["Folding_Score"].apply(regime_tag)
+
+        collapse_df = plot_df[plot_df["Score_Change"] < -collapse_threshold].copy()
+
+        plot_df["Price_Median"] = plot_df["Close"].rolling(10).median()
 
         fig = px.scatter(
             plot_df,
             x=x_col,
             y="Close",
-            color="Folding_Score",
-            title=f"{symbol} | Price vs Folding Score",
-            color_continuous_scale=FOLD_COLORSCALE,
+            color="Regime",
+            title=f"{symbol} | Price vs Folding Regimes",
+            color_discrete_map=REGIME_COLORS,
         )
-        fig.update_traces(marker=dict(size=4))
-        fig.update_coloraxes(colorbar_title="Folding Score (Red=Low, Blue=High)")
+        fig.update_traces(marker=dict(size=6, opacity=0.85))
 
+        # rolling trend line
+        fig.add_scatter(
+            x=plot_df[x_col],
+            y=plot_df["Price_Median"],
+            mode="lines",
+            name="Price (Rolling Median)",
+            line=dict(width=2, dash="dot", color="#222222"),
+        )
+
+        # collapse markers
         if not collapse_df.empty:
             fig.add_scatter(
                 x=collapse_df[x_col],
                 y=collapse_df["Close"],
                 mode="markers",
-                name="⚠️ Collapse Risk",
-                marker=dict(color="#FF0000", size=9, symbol="x")
+                name="⚠️ Collapse Drop",
+                marker=dict(color="#FF0000", size=10, symbol="x")
             )
 
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.01, y=0.99, showarrow=False,
+            text=f"Regime thresholds: Q33={q33:.3f}, Q66={q66:.3f} | Red=Low, Orange=Mid, Blue=High",
+            font=dict(size=12)
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        # ---------- SCORE CHART (Dark Blue line + Collapse Markers) ----------
+        # regime summary
+        latest_regime = plot_df["Regime"].iloc[-1]
+        pct_low  = (plot_df["Regime"] == "LOW (Structured)").mean() * 100
+        pct_mid  = (plot_df["Regime"] == "MID (Transition)").mean() * 100
+        pct_high = (plot_df["Regime"] == "HIGH (Chaotic)").mean() * 100
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Latest Regime", latest_regime)
+        c2.metric("% Time Low",  f"{pct_low:.1f}%")
+        c3.metric("% Time Mid",  f"{pct_mid:.1f}%")
+        c4.metric("% Time High", f"{pct_high:.1f}%")
+
+        st.caption(
+            "Interpretation: LOW(Structured)=more ordered/mean-reverting; HIGH(Chaotic)=unstable/trending regime; MID=transition. "
+            "⚠️ Red X marks sudden score drops (possible regime snap)."
+        )
+
+        # ================= SCORE LINE CHART =================
         st.subheader("📉 Folding Score (Dark Blue) + Collapse Drops (Red X)")
         score_df = plot_df.copy()
         collapse_score = score_df[score_df["Score_Change"] < -collapse_threshold].copy()
 
-        fig2 = px.line(
-            score_df,
-            x=x_col,
-            y="Folding_Score",
-            title="Folding Score Over Time"
-        )
+        fig2 = px.line(score_df, x=x_col, y="Folding_Score", title="Folding Score Over Time")
         fig2.update_traces(line=dict(color="#00008B", width=2))
 
         if not collapse_score.empty:
@@ -458,6 +492,7 @@ if tabs == "Single Stock Analyzer":
 
         st.plotly_chart(fig2, use_container_width=True)
 
+        # ---------------- DOWNLOAD ----------------
         st.subheader("⬇️ Download computed data")
         dl_df = usable.reset_index().rename(columns={"DateTime": "datetime"})
         st.download_button(
