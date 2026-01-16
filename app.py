@@ -11,6 +11,14 @@ from io import BytesIO
 from Stock_list_token import stock_list
 
 
+# ------------------- COLOR SETTINGS -------------------
+# Low (bad/low score) = Dark Red, High (good/high score) = Dark Blue
+FOLD_COLORSCALE = [
+    [0.0, "#8B0000"],  # dark red
+    [1.0, "#00008B"],  # dark blue
+]
+
+
 # ------------------- BATCH HELPERS -------------------
 def chunk_list(items, chunk_size=200):
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
@@ -27,12 +35,6 @@ def make_batch_labels(chunks):
 
 # ------------------- EXCEL DOWNLOAD HELPERS (FIX TZ DATETIMES) -------------------
 def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Excel doesn't support timezone-aware datetimes.
-    This function:
-    - converts tz-aware datetime columns to tz-naive
-    - converts tz-aware datetime index to tz-naive
-    """
     out = df.copy()
 
     # Fix timezone-aware index
@@ -127,12 +129,13 @@ def angel_login():
 obj = angel_login()
 
 
-# ------------------- FETCH CANDLES (DATE RANGE) -------------------
-def fetch_candles(symbol: str, token: str, interval="ONE_HOUR",
-                  from_date: date = None, to_date: date = None) -> pd.DataFrame:
-    if from_date is None or to_date is None:
-        return pd.DataFrame()
-
+# ------------------- INTERNAL: FETCH RAW CANDLES -------------------
+def _fetch_raw(symbol: str, token: str, interval: str, from_date: date, to_date: date) -> pd.DataFrame:
+    """
+    Raw candle fetch from Angel One.
+    ONE_DAY -> fromdate/todate as YYYY-MM-DD (no time)
+    Others  -> YYYY-MM-DD HH:MM
+    """
     start_dt = datetime.combine(from_date, datetime.min.time())
     end_dt = datetime.combine(to_date, datetime.max.time())
     if start_dt >= end_dt:
@@ -145,12 +148,19 @@ def fetch_candles(symbol: str, token: str, interval="ONE_HOUR",
     while cur_start < end_dt:
         cur_end = min(cur_start + timedelta(days=chunk_days), end_dt)
 
+        if interval == "ONE_DAY":
+            from_str = cur_start.strftime("%Y-%m-%d")
+            to_str = cur_end.strftime("%Y-%m-%d")
+        else:
+            from_str = cur_start.strftime("%Y-%m-%d %H:%M")
+            to_str = cur_end.strftime("%Y-%m-%d %H:%M")
+
         params = {
             "exchange": "NSE",
             "symboltoken": str(token),
             "interval": interval,
-            "fromdate": cur_start.strftime("%Y-%m-%d %H:%M"),
-            "todate": cur_end.strftime("%Y-%m-%d %H:%M"),
+            "fromdate": from_str,
+            "todate": to_str,
         }
 
         resp = obj.getCandleData(params)
@@ -164,25 +174,86 @@ def fetch_candles(symbol: str, token: str, interval="ONE_HOUR",
 
     df = pd.DataFrame(rows, columns=["DateTime", "Open", "High", "Low", "Close", "Volume"])
     df["DateTime"] = pd.to_datetime(df["DateTime"], errors="coerce")
-    df = df.dropna(subset=["DateTime"]).drop_duplicates(subset=["DateTime"]).sort_values("DateTime")
-    df.set_index("DateTime", inplace=True)
+    df = df.dropna(subset=["DateTime"])
 
+    # tz-safe
+    try:
+        df["DateTime"] = df["DateTime"].dt.tz_localize(None)
+    except Exception:
+        pass
+
+    # numeric cast
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna()
 
-    # Make index tz-naive for safety (Excel)
-    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-        df.index = df.index.tz_convert(None)
-
+    df = df.sort_values("DateTime")
+    df = df.drop_duplicates(subset=["DateTime"], keep="last")  # safe for intraday
+    df.set_index("DateTime", inplace=True)
     return df
+
+
+# ------------------- RESAMPLE HOURLY -> DAILY (fallback) -------------------
+def resample_to_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert intraday OHLCV to daily OHLCV.
+    """
+    if df.empty:
+        return df
+
+    d = df.copy()
+    if not isinstance(d.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+
+    # Daily OHLCV
+    daily = d.resample("1D").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
+
+    return daily
+
+
+# ------------------- FETCH CANDLES (DATE RANGE + ONE_DAY FIX + FALLBACK) -------------------
+def fetch_candles(symbol: str, token: str, interval="ONE_HOUR",
+                  from_date: date = None, to_date: date = None) -> pd.DataFrame:
+    """
+    ✅ ONE_DAY FIX:
+    - Use YYYY-MM-DD params for ONE_DAY
+    - If ONE_DAY returns too few rows, fallback to ONE_HOUR + resample daily
+    """
+    if from_date is None or to_date is None:
+        return pd.DataFrame()
+
+    raw = _fetch_raw(symbol, token, interval, from_date, to_date)
+
+    # If user selected ONE_DAY, ensure we truly have daily series
+    if interval == "ONE_DAY":
+        # Many times Angel returns very few daily rows → fallback
+        expected_days = (to_date - from_date).days + 1
+        if raw.empty or len(raw) < min(10, expected_days // 4 + 1):
+            # fallback: fetch hourly and resample
+            hourly = _fetch_raw(symbol, token, "ONE_HOUR", from_date, to_date)
+            daily = resample_to_daily(hourly)
+            return daily
+
+        # If raw has daily but weird duplicate dates, keep 1 candle per date
+        tmp = raw.reset_index()
+        tmp["Date"] = tmp["DateTime"].dt.date
+        tmp = tmp.sort_values("DateTime").drop_duplicates(subset=["Date"], keep="last").drop(columns=["Date"])
+        tmp = tmp.sort_values("DateTime").set_index("DateTime")
+        return tmp
+
+    return raw
 
 
 # ------------------- MARKET FOLDING COMPUTATION -------------------
 def compute_folding(df: pd.DataFrame, window_size=50, smooth=5) -> pd.DataFrame:
     df = df.copy()
 
-    # Features
     df["RSI"] = rsi(df["Close"], period=14) / 100.0
 
     bbw_raw = bollinger_bandwidth(df["Close"], length=20, std_mult=2.0)
@@ -219,7 +290,7 @@ def compute_folding(df: pd.DataFrame, window_size=50, smooth=5) -> pd.DataFrame:
     df["Market_Entropy"] = ent
     df["Folding_Score"] = df["Market_Entropy"].rolling(smooth).mean()
 
-    # Future Vol (next 24 candles)
+    # Future Vol (next 24 candles) — meaningful mostly on intraday; still keep for consistency
     df["Future_Vol"] = df["Close"].shift(-24).rolling(24).std()
 
     return df
@@ -275,6 +346,7 @@ to_date = st.sidebar.date_input("To Date", value=default_to)
 
 window_size = st.sidebar.slider("Window Size", 20, 200, 50, step=5)
 smooth = st.sidebar.slider("Smoothing", 1, 20, 5, step=1)
+collapse_threshold = st.sidebar.slider("Collapse Threshold", 0.05, 1.00, 0.35, 0.05)
 
 
 # ===================== TAB 1: SINGLE STOCK =====================
@@ -301,8 +373,10 @@ if tabs == "Single Stock Analyzer":
             df = fetch_candles(symbol, token, interval=interval, from_date=from_date, to_date=to_date)
 
         if df.empty:
-            st.error("No candle data. Try ONE_DAY interval or change date range.")
+            st.error("No candle data returned. Try ONE_HOUR or change date range.")
             st.stop()
+
+        st.caption(f"Rows fetched: {len(df)} | Date range: {df.index.min()} → {df.index.max()}")
 
         with st.spinner("Computing Folding Score..."):
             out = compute_folding(df, window_size=window_size, smooth=smooth)
@@ -319,23 +393,70 @@ if tabs == "Single Stock Analyzer":
         st.metric("Latest Folding Score", f"{last['Folding_Score']:.4f}", delta=f"{change:.4f}")
         st.metric("Latest Close", f"{last['Close']:.2f}")
 
-        alert = detect_collapse_alert(out, drop_threshold=0.35)
+        alert = detect_collapse_alert(out, drop_threshold=collapse_threshold)
         if alert:
             st.error(f"⚠️ {alert['message']}")
             add_alert(symbol, token, alert["type"], alert["message"], alert["score"])
 
-        st.subheader("📈 Price colored by Folding Score")
+        # ---------- PRICE CHART (Red->Blue + Collapse Markers) ----------
+        st.subheader("📈 Price colored by Folding Score (Red=Low, Blue=High)")
+        plot_df = usable.reset_index().copy()
+        plot_df["Score_Change"] = plot_df["Folding_Score"].diff()
+        collapse_df = plot_df[plot_df["Score_Change"] < -collapse_threshold].copy()
+
+        # If ONE_DAY, show x as Date (cleaner)
+        if interval == "ONE_DAY":
+            plot_df["X"] = plot_df["DateTime"].dt.date
+            if not collapse_df.empty:
+                collapse_df["X"] = collapse_df["DateTime"].dt.date
+            x_col = "X"
+        else:
+            x_col = "DateTime"
+
         fig = px.scatter(
-            usable.reset_index(),
-            x="DateTime", y="Close",
+            plot_df,
+            x=x_col,
+            y="Close",
             color="Folding_Score",
             title=f"{symbol} | Price vs Folding Score",
+            color_continuous_scale=FOLD_COLORSCALE,
         )
         fig.update_traces(marker=dict(size=4))
+        fig.update_coloraxes(colorbar_title="Folding Score (Red=Low, Blue=High)")
+
+        if not collapse_df.empty:
+            fig.add_scatter(
+                x=collapse_df[x_col],
+                y=collapse_df["Close"],
+                mode="markers",
+                name="⚠️ Collapse Risk",
+                marker=dict(color="#FF0000", size=9, symbol="x")
+            )
+
         st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("📉 Folding Score (line)")
-        fig2 = px.line(usable.reset_index(), x="DateTime", y="Folding_Score", title="Folding Score Over Time")
+        # ---------- SCORE CHART (Dark Blue line + Collapse Markers) ----------
+        st.subheader("📉 Folding Score (Dark Blue) + Collapse Drops (Red X)")
+        score_df = plot_df.copy()
+        collapse_score = score_df[score_df["Score_Change"] < -collapse_threshold].copy()
+
+        fig2 = px.line(
+            score_df,
+            x=x_col,
+            y="Folding_Score",
+            title="Folding Score Over Time"
+        )
+        fig2.update_traces(line=dict(color="#00008B", width=2))
+
+        if not collapse_score.empty:
+            fig2.add_scatter(
+                x=collapse_score[x_col],
+                y=collapse_score["Folding_Score"],
+                mode="markers",
+                name="⚠️ Collapse Drop",
+                marker=dict(color="#FF0000", size=9, symbol="x")
+            )
+
         st.plotly_chart(fig2, use_container_width=True)
 
         st.subheader("⬇️ Download computed data")
@@ -390,7 +511,7 @@ elif tabs == "Scanner":
                 change = float(last["Folding_Score"] - prev["Folding_Score"])
 
                 status = "HEALTHY_COMPLEXITY" if last["Folding_Score"] > usable["Folding_Score"].median() else "LOW_COMPLEXITY"
-                if change < -0.35:
+                if change < -collapse_threshold:
                     status = "COLLAPSE_RISK"
                     msg = f"{sym}: Folding score drop detected (Δ {change:.3f})"
                     add_alert(sym, token, "COLLAPSE_RISK", msg, float(last["Folding_Score"]))
@@ -403,7 +524,7 @@ elif tabs == "Scanner":
             progress.progress((idx + 1) / n)
 
         if not results:
-            st.warning("No scan results for this batch. Try ONE_DAY interval or change date range.")
+            st.warning("No scan results for this batch. Try ONE_HOUR/ONE_DAY with different date range.")
         else:
             df_res = pd.DataFrame(results, columns=["Stock", "Last Close", "Last Folding Score", "Score Change", "Status"])
             df_res = df_res.sort_values("Last Folding Score", ascending=True)
@@ -451,10 +572,10 @@ elif tabs == "Entropy Watchlist":
                 prev = usable.iloc[-2] if len(usable) > 1 else last
                 change = float(last["Folding_Score"] - prev["Folding_Score"])
 
-                tag = "✅ Healthy" if change >= -0.35 else "⚠️ Collapse Risk"
+                tag = "✅ Healthy" if change >= -collapse_threshold else "⚠️ Collapse Risk"
                 rows.append([sym, float(last["Close"]), float(last["Folding_Score"]), change, tag])
 
-                if change < -0.35:
+                if change < -collapse_threshold:
                     msg = f"{sym}: Watchlist collapse risk (Δ {change:.3f})"
                     add_alert(sym, token, "WATCHLIST_COLLAPSE_RISK", msg, float(last["Folding_Score"]))
 
