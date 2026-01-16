@@ -14,10 +14,9 @@ from Stock_list_token import stock_list
 # ------------------- COLOR SETTINGS -------------------
 # Low (bad/low score) = Dark Red, High (good/high score) = Dark Blue
 FOLD_COLORSCALE = [
-    [0.0, "#9BFA15"],  # dark red
+    [0.0, "#8B0000"],  # dark red
     [1.0, "#00008B"],  # dark blue
 ]
-
 
 # ------------------- BATCH HELPERS -------------------
 def chunk_list(items, chunk_size=200):
